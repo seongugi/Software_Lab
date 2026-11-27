@@ -1,108 +1,11 @@
-#define NOMINMAX
-#include <windows.h>
+#include "common.h"
 #include <d3d11.h>
 #include <wrl/client.h>
-#include <array>
 #include <algorithm>
-#include <cmath>
-#include <cstdint>
 #include <cstdio>
 
-constexpr int W = 64, H = 40, N = 20;
-constexpr int Pilots = 64;
-constexpr int LumaBytes = W * H;
-constexpr int ChromaBytes = LumaBytes / 2;
-using Frame = std::array<std::uint8_t, LumaBytes + ChromaBytes>;
-constexpr int FrameBits = 8 * (LumaBytes + ChromaBytes);
-constexpr int Views = 4;
-using Wave = std::array<float, N>;
-enum { Free, Sent, Noisy };
-
-// Shared-memory layout. The same definition is used in all three programs.
-struct Link {
-    volatile LONG state;
-    int nextAdaptiveBits;
-    int bits[Views];
-    Frame original; // For error measurement only.
-    Wave pilots[Pilots];
-    Wave signal[Views][FrameBits];
-};
-
-class Mapping {
-    HANDLE handle = nullptr;
-public:
-    Link* link = nullptr;
-    Mapping() {
-        handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                    0, sizeof(Link), "AdaptiveVideoNv12Tuned");
-        if (handle)
-            link = static_cast<Link*>(MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Link)));
-    }
-    ~Mapping() {
-        if (link) UnmapViewOfFile(link);
-        if (handle) CloseHandle(handle);
-    }
-};
-
-inline LONG state(Link& link) {
-    return InterlockedCompareExchange(&link.state, Free, Free);
-}
-
 Mapping mapping;
-
-inline const char* mode(int bits) {
-    return bits == 1 ? "BPSK" : bits == 2 ? "QPSK" : "16-QAM";
-}
-
-double c0[N], c1[N];
-
-void makeBasis() {
-    for (int k = 0; k < N; ++k) {
-        double phase = 2 * std::acos(-1.0) * k / N;
-        c0[k] = std::sqrt(2.0 / N) * std::cos(phase);
-        c1[k] = std::sqrt(2.0 / N) * std::sin(phase);
-    }
-}
-
-void point(int data, int width, double& i, double& q) {
-    const int levels[] = {1, 3, -1, -3};
-    if (width == 1) {
-        i = 1 - 2 * data;
-        q = 0;
-    } else if (width == 2) {
-        i = (1 - 2 * (data >> 1)) / std::sqrt(2.0);
-        q = (1 - 2 * (data & 1)) / std::sqrt(2.0);
-    } else {
-        i = levels[data >> 2] / std::sqrt(10.0);
-        q = levels[data & 3] / std::sqrt(10.0);
-    }
-}
-
-
-void project(const Wave& r, double& i, double& q) {
-    i = q = 0;
-    for (int k = 0; k < N; ++k) {
-        i += r[k] * c0[k];
-        q += r[k] * c1[k];
-    }
-}
-
-int decode(const Wave& r, int width) {
-    double i, q;
-    project(r, i, q);
-    double best = 1e9;
-    int decoded = 0;
-    for (int data = 0; data < (1 << width); ++data) {
-        double a, b;
-        point(data, width, a, b);
-        double distance = (i - a) * (i - a) + (q - b) * (q - b);
-        if (distance < best) {
-            best = distance;
-            decoded = data;
-        }
-    }
-    return decoded;
-}
+Modem modem;
 
 using Microsoft::WRL::ComPtr;
 
@@ -121,6 +24,7 @@ public:
         HWND window = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE,
             x, y, W * 5, H * 5, parent, nullptr, GetModuleHandleA(nullptr), nullptr);
         if (!window) return E_FAIL;
+
         DXGI_SWAP_CHAIN_DESC swap{};
         swap.BufferDesc.Width = W * 5;
         swap.BufferDesc.Height = H * 5;
@@ -232,13 +136,11 @@ void receiveFrame(Link& link) {
     double error = 0;
     for (const Wave& pilot : link.pilots) {
         double i, q;
-        project(pilot, i, q);
+        modem.project(pilot, i, q);
         error += (i - 1) * (i - 1) + q * q;
     }
-
-    // The only adaptive policy: pick the next frame's modulation
-    // from the noise estimated using known pilot symbols.
     double sigma = std::sqrt(error / (2 * Pilots));
+
     const double qamNoiseLimit = 0.08;
     const double qpskNoiseLimit = 0.18;
     if (sigma < qamNoiseLimit)
@@ -255,18 +157,18 @@ void receiveFrame(Link& link) {
         for (auto& sample : received[view]) {
             int value = 0;
             for (int b = 0; b < 8; b += bits)
-                value = (value << bits) | decode(link.signal[view][index++], bits);
+                value = (value << bits) | modem.decode(link.signal[view][index++], bits);
             sample = static_cast<std::uint8_t>(value);
         }
     }
 
-    // Count differing bytes across the complete NV12 frame.
     for (int view = 0; view < Views; ++view) {
         byteErrors[view] = 0;
         for (std::size_t i = 0; i < received[view].size(); ++i)
             byteErrors[view] += received[view][i] != link.original[i];
     }
     hasFrame = true;
+
     InterlockedExchange(&link.state, Free);
 }
 
@@ -279,9 +181,9 @@ void paint(HDC dc) {
         int y = 10 + view / 2 * PanelRowHeight;
         char text[96];
         int bits = currentBits[view];
+
         if (hasFrame) {
-            double errorRate = 100.0 * byteErrors[view] /
-                               (LumaBytes + ChromaBytes);
+            double errorRate = 100.0 * byteErrors[view] / (LumaBytes + ChromaBytes);
             std::snprintf(text, sizeof text, "%s | %s | Error rate %.2f%%",
                           names[view], mode(bits), errorRate);
         } else {
@@ -310,9 +212,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
                     54 + view / 2 * PanelRowHeight), "Opening the NV12 renderer")) return -1;
         SetTimer(window, 1, 50, nullptr);
         return 0;
+
     case WM_TIMER:
         if (state(*mapping.link) != Noisy) return 0;
+
         receiveFrame(*mapping.link);
+
         for (int view = 0; view < Views; ++view) {
             if (!checkVideo(video[view].show(received[view]), "Rendering a received frame")) {
                 DestroyWindow(window);
@@ -321,6 +226,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
         }
         InvalidateRect(window, nullptr, FALSE);
         return 0;
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(window, &ps);
@@ -328,6 +234,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
         EndPaint(window, &ps);
         return 0;
     }
+
     case WM_DESTROY:
         KillTimer(window, 1);
         PostQuitMessage(0);
@@ -341,7 +248,6 @@ int main() {
         std::fprintf(stderr, "Could not open shared channel.\n");
         return 1;
     }
-    makeBasis();
 
     HINSTANCE instance = GetModuleHandleA(nullptr);
     WNDCLASSA wc{};
@@ -351,17 +257,20 @@ int main() {
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = "Receiver";
     if (!RegisterClassA(&wc)) return 1;
+
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT size{0, 0, 688, 520};
     AdjustWindowRect(&size, style, FALSE);
+
     HWND window = CreateWindowA("Receiver", "Receiver", style, 425, 60,
         size.right - size.left, size.bottom - size.top, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
+
     ShowWindow(window, SW_SHOW);
+
     MSG msg;
     while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
 }
-
